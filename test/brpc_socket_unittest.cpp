@@ -1,9 +1,8 @@
-// Baidu RPC - A framework to host and access services throughout Baidu.
+// brpc - A framework to host and access services throughout Baidu.
 // Copyright (c) 2014 Baidu, Inc.
 
 // Date: Sun Jul 13 15:04:18 CST 2014
 
-#include <sys/epoll.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <fcntl.h>  // F_GETFD
@@ -20,6 +19,9 @@
 #include "brpc/policy/hulu_pbrpc_protocol.h"
 #include "brpc/policy/most_common_message.h"
 #include "brpc/nshead.h"
+#if defined(OS_MACOSX)
+#include <sys/event.h>
+#endif
 
 #define CONNECT_IN_KEEPWRITE 1;
 
@@ -362,7 +364,11 @@ TEST_F(SocketTest, single_threaded_connect_and_write) {
                 bthread_usleep(1000);
                 ASSERT_LT(butil::gettimeofday_us(), start_time + 1000000L) << "Too long!";
             }
+#if defined(OS_LINUX)
             ASSERT_EQ(0, bthread_fd_wait(s->fd(), EPOLLIN));
+#elif defined(OS_MACOSX)
+            ASSERT_EQ(0, bthread_fd_wait(s->fd(), EVFILT_READ));
+#endif
             char dest[sizeof(buf)];
             ASSERT_EQ(meta_len + len, (size_t)read(s->fd(), dest, sizeof(dest)));
             ASSERT_EQ(0, memcmp(buf + 12, dest, meta_len + len));
@@ -392,7 +398,7 @@ void* FailedWriter(void* void_arg) {
     WriterArg* arg = static_cast<WriterArg*>(void_arg);
     brpc::SocketUniquePtr sock;
     if (brpc::Socket::Address(arg->socket_id, &sock) < 0) {
-        printf("Fail to address SocketId=%lu\n", arg->socket_id);
+        printf("Fail to address SocketId=%" PRIu64 "\n", arg->socket_id);
         return NULL;
     }
     char buf[32];
@@ -497,7 +503,7 @@ TEST_F(SocketTest, not_health_check_when_nref_hits_0) {
         ASSERT_EQ(wait_id.value, data.id.value);
         ASSERT_EQ(ECONNREFUSED, data.error_code);
         ASSERT_TRUE(butil::StringPiece(data.error_text).starts_with(
-                        "Fail to make SocketId="));
+                        "Fail to connect SocketId="));
 #else
         ASSERT_EQ(-1, s->Write(&src));
         ASSERT_EQ(ECONNREFUSED, errno);
@@ -577,7 +583,7 @@ TEST_F(SocketTest, health_check) {
     ASSERT_EQ(wait_id.value, data.id.value);
     ASSERT_EQ(ECONNREFUSED, data.error_code);
     ASSERT_TRUE(butil::StringPiece(data.error_text).starts_with(
-                    "Fail to make SocketId="));
+                    "Fail to connect SocketId="));
     if (use_my_message) {
         ASSERT_TRUE(appended_msg);
     }
@@ -667,7 +673,7 @@ void* Writer(void* void_arg) {
     WriterArg* arg = static_cast<WriterArg*>(void_arg);
     brpc::SocketUniquePtr sock;
     if (brpc::Socket::Address(arg->socket_id, &sock) < 0) {
-        printf("Fail to address SocketId=%lu\n", arg->socket_id);
+        printf("Fail to address SocketId=%" PRIu64 "\n", arg->socket_id);
         return NULL;
     }
     char buf[32];
@@ -683,7 +689,7 @@ void* Writer(void* void_arg) {
                 --i;
                 continue;
             }
-            printf("Fail to write into SocketId=%lu, %s\n",
+            printf("Fail to write into SocketId=%" PRIu64 ", %s\n",
                    arg->socket_id, berror());
             break;
         }
@@ -788,7 +794,7 @@ void* FastWriter(void* void_arg) {
     WriterArg* arg = static_cast<WriterArg*>(void_arg);
     brpc::SocketUniquePtr sock;
     if (brpc::Socket::Address(arg->socket_id, &sock) < 0) {
-        printf("Fail to address SocketId=%lu\n", arg->socket_id);
+        printf("Fail to address SocketId=%" PRIu64 "\n", arg->socket_id);
         return NULL;
     }
     char buf[] = "hello reader side!";
@@ -806,7 +812,7 @@ void* FastWriter(void* void_arg) {
                 ++nretry;
                 continue;
             }
-            printf("Fail to write into SocketId=%lu, %s\n",
+            printf("Fail to write into SocketId=%" PRIu64 ", %s\n",
                    arg->socket_id, berror());
             break;
         }
@@ -879,14 +885,14 @@ TEST_F(SocketTest, multi_threaded_write_perf) {
 
     butil::Timer tm;
     ProfilerStart("write.prof");
-    const size_t old_nread = reader_arg.nread;
+    const uint64_t old_nread = reader_arg.nread;
     tm.start();
     sleep(2);
     tm.stop();
-    const size_t new_nread = reader_arg.nread;
+    const uint64_t new_nread = reader_arg.nread;
     ProfilerStop();
 
-    printf("tp=%luM/s\n", (new_nread - old_nread) / tm.u_elapsed());
+    printf("tp=%" PRIu64 "M/s\n", (new_nread - old_nread) / tm.u_elapsed());
     
     for (size_t i = 0; i < ARRAY_SIZE(th); ++i) {
         args[i].times = 0;

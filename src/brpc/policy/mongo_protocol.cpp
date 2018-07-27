@@ -31,7 +31,7 @@
 #include "brpc/details/usercode_backup_pool.h"
 
 extern "C" {
-void bthread_assign_data(void* data) __THROW;
+void bthread_assign_data(void* data);
 }
 
 
@@ -39,18 +39,16 @@ namespace brpc {
 namespace policy {
 
 struct SendMongoResponse : public google::protobuf::Closure {
-    SendMongoResponse(const Server *server, Socket *socket) :
+    SendMongoResponse(const Server *server) :
         status(NULL),
-        start_callback_us(0L),
-        server(server),
-        socket(socket) {}
+        received_us(0L),
+        server(server) {}
     ~SendMongoResponse();
     void Run();
 
     MethodStatus* status;
-    long start_callback_us;
+    int64_t received_us;
     const Server *server;
-    SocketUniquePtr socket;
     Controller cntl;
     MongoRequest req;
     MongoResponse res;
@@ -63,6 +61,7 @@ SendMongoResponse::~SendMongoResponse() {
 void SendMongoResponse::Run() {
     std::unique_ptr<SendMongoResponse> delete_self(this);
     ScopedMethodStatus method_status(status);
+    Socket* socket = ControllerPrivateAccessor(&cntl).get_sending_socket();
 
     if (cntl.IsCloseConnection()) {
         socket->SetFailed();
@@ -105,7 +104,7 @@ void SendMongoResponse::Run() {
     }
     if (method_status) {
         method_status.release()->OnResponded(
-            !cntl.Failed(), butil::cpuwide_time_us() - start_callback_us);
+            !cntl.Failed(), butil::cpuwide_time_us() - received_us);
     }
 }
 
@@ -174,7 +173,8 @@ void EndRunningCallMethodInPool(
 
 void ProcessMongoRequest(InputMessageBase* msg_base) {
     DestroyingPtr<MostCommonMessage> msg(static_cast<MostCommonMessage*>(msg_base));
-    SocketUniquePtr socket(msg->ReleaseSocket());
+    SocketUniquePtr socket_guard(msg->ReleaseSocket());
+    Socket* socket = socket_guard.get();
     const Server* server = static_cast<const Server*>(msg_base->arg());
     ScopedNonServiceError non_service_error(server);
 
@@ -199,17 +199,18 @@ void ProcessMongoRequest(InputMessageBase* msg_base) {
         return;
     }
 
-    SendMongoResponse* mongo_done = new SendMongoResponse(server, socket.release());
+    SendMongoResponse* mongo_done = new SendMongoResponse(server);
     mongo_done->cntl.set_mongo_session_data(context_msg->context());
 
     ControllerPrivateAccessor accessor(&(mongo_done->cntl));
     accessor.set_server(server)
         .set_security_mode(server->options().security_mode())
-        .set_peer_id(mongo_done->socket->id())
-        .set_remote_side(mongo_done->socket->remote_side())
-        .set_local_side(mongo_done->socket->local_side())
-        .set_auth_context(mongo_done->socket->auth_context())
-        .set_request_protocol(PROTOCOL_MONGO);
+        .set_peer_id(socket->id())
+        .set_remote_side(socket->remote_side())
+        .set_local_side(socket->local_side())
+        .set_auth_context(socket->auth_context())
+        .set_request_protocol(PROTOCOL_MONGO)
+        .move_in_server_receiving_sock(socket_guard);
 
     // Tag the bthread with this server's key for
     // thread_local_data().
@@ -266,7 +267,7 @@ void ProcessMongoRequest(InputMessageBase* msg_base) {
         mongo_done->req.mutable_header()->set_op_code(
                 static_cast<MongoOp>(header->op_code));
         mongo_done->res.mutable_header()->set_response_to(header->request_id);
-        mongo_done->start_callback_us = butil::cpuwide_time_us();
+        mongo_done->received_us = msg->received_us();
 
         google::protobuf::Service* svc = mp->service;
         const google::protobuf::MethodDescriptor* method = mp->method;
